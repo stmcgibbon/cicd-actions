@@ -1,0 +1,152 @@
+# Copyright (c) 2025 Mercedes-Benz AG
+# Frank Sprünken <accenture.spruenken@extaccount.com>
+#
+# Version History:
+# 1.0.0 - 2025-11-24 - Initial release (F. Spruenken)
+# 1.0.1 - 2026-01-26 - Added more logging (O. Weng)
+# 1.0.2 - 2026-03-05 - Added EMU (Enterprise Managed User) actor resolution (O. Weng)
+
+name: 'Check Team Authorization'
+description: 'Verifies if the workflow actor is a member of a specified GitHub team'
+inputs:
+  team-slug:
+    description: 'Team slug to check membership against'
+    required: true
+  github-token:
+    description: 'GitHub token with members:read permission'
+    required: true
+  organization:
+    description: 'GitHub organization name (auto-detected if not provided)'
+    required: false
+    default: ''
+outputs:
+  authorized:
+    description: 'Whether the user is authorized (true/false)'
+    value: ${{ steps.check.outputs.authorized }}
+  user:
+    description: 'The username that was checked'
+    value: ${{ steps.check.outputs.user }}
+  organization:
+    description: 'The organization that was checked'
+    value: ${{ steps.check.outputs.organization }}
+runs:
+  using: 'composite'
+  steps:
+    - name: Check team membership
+      id: check
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        GH_ENTERPRISE_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set +e
+        
+        # Auto-detect organization from repository context
+        if [ -z "${{ inputs.organization }}" ]; then
+          ORG="${{ github.repository_owner }}"
+        else
+          ORG="${{ inputs.organization }}"
+        fi
+        
+        # Get GitHub server URL and extract hostname
+        GITHUB_URL="${{ github.server_url }}"
+        GH_HOSTNAME=$(echo "$GITHUB_URL" | sed -e 's|^https://||' -e 's|^http://||' -e 's|/$||')
+        
+        TEAM_SLUG="${{ inputs.team-slug }}"
+        ACTOR="${{ github.actor }}"
+        
+        # Resolve EMU (Enterprise Managed User) suffix if present
+        # EMU users have format USERNAME_SHORTCODE (e.g., johndoe_a1b2c3d4)
+        # We validate by checking if the full actor name exists as a user
+        user_check=$(gh api --hostname "$GH_HOSTNAME" "/users/$ACTOR" 2>&1)
+        user_check_status=$?
+        if [ $user_check_status -ne 0 ]; then
+          ACTOR_SHORT="${ACTOR%_*}"
+          if [ "$ACTOR_SHORT" != "$ACTOR" ]; then
+            echo "⚠️  User '$ACTOR' not found, trying '$ACTOR_SHORT' (potential EMU suffix stripped)"
+            user_check2=$(gh api --hostname "$GH_HOSTNAME" "/users/$ACTOR_SHORT" 2>&1)
+            if [ $? -eq 0 ]; then
+              echo "✅ Resolved actor to '$ACTOR_SHORT'"
+              ACTOR="$ACTOR_SHORT"
+            else
+              echo "⚠️  Neither '${{ github.actor }}' nor '$ACTOR_SHORT' found as users, using original"
+              ACTOR="${{ github.actor }}"
+            fi
+          fi
+        fi
+        
+        echo "════════════════════════════════════════════════════════"
+        echo "🔐 AUTHORIZATION CHECK"
+        echo "════════════════════════════════════════════════════════"
+        echo "👤 User: $ACTOR"
+        echo "🏢 Organization: $ORG"
+        echo "👥 Required Team: $TEAM_SLUG"
+        echo "📦 Repository: ${{ github.repository }}"
+        echo "🌐 GitHub URL: $GITHUB_URL"
+        echo "════════════════════════════════════════════════════════"
+        echo ""
+        
+        # Save outputs
+        echo "organization=$ORG" >> $GITHUB_OUTPUT
+        echo "user=$ACTOR" >> $GITHUB_OUTPUT
+        
+        # Verify token is available
+        if [ -z "$GH_TOKEN" ]; then
+          echo "❌ ERROR: GitHub token is not set or empty"
+          echo "authorized=false" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+        
+        # Check if user is member of the authorized team
+        response=$(gh api --hostname "$GH_HOSTNAME" \
+          -H "Accept: application/vnd.github+json" \
+          "/orgs/$ORG/teams/$TEAM_SLUG/memberships/$ACTOR" 2>&1)
+        status=$?
+        
+        if [ $status -eq 0 ]; then
+          echo "✅ AUTHORIZATION SUCCESSFUL"
+          echo ""
+          echo "✓ User $ACTOR is a member of '$TEAM_SLUG'"
+          echo "✓ Access granted (via membership API)"
+          echo "⏱️  Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+          echo ""
+          echo "════════════════════════════════════════════════════════"
+          echo "authorized=true" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+        
+        # Alternative method - check if user is in team members list
+        response2=$(gh api --hostname "$GH_HOSTNAME" \
+          -H "Accept: application/vnd.github+json" \
+          "/orgs/$ORG/teams/$TEAM_SLUG/members" 2>&1)
+        status2=$?
+        
+        if [ $status2 -eq 0 ]; then
+          TEAM_MEMBERS=$(echo "$response2" | jq -r '.[].login' 2>/dev/null)
+          
+          if echo "$TEAM_MEMBERS" | grep -q "^${ACTOR}$"; then
+            echo "✅ AUTHORIZATION SUCCESSFUL"
+            echo ""
+            echo "✓ User $ACTOR is a member of '$TEAM_SLUG'"
+            echo "✓ Access granted (via team members list)"
+            echo "⏱️  Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+            echo ""
+            echo "════════════════════════════════════════════════════════"
+            echo "authorized=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+        fi
+        
+        # Authorization failed
+        echo "❌ AUTHORIZATION FAILED"
+        echo ""
+        echo "✗ User $ACTOR is NOT a member of '$TEAM_SLUG'"
+        echo "✗ Access denied"
+        echo ""
+        echo "📋 To gain access:"
+        echo "   1. Check team membership at: $GITHUB_URL/orgs/$ORG/teams/$TEAM_SLUG"
+        echo "   2. Contact your team administrator to request access"
+        echo ""
+        echo "════════════════════════════════════════════════════════"
+        echo "authorized=false" >> $GITHUB_OUTPUT
+        exit 1
