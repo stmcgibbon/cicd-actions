@@ -1,0 +1,703 @@
+# Copyright (c) 2025 Mercedes-Benz AG
+# Oliver Weng <sap.weng@extaccount.com>
+#
+# Version History:
+# 1.0.0 - 2025-11-24 - Initial release (O. Weng)
+# 1.0.1 - 2026-01-26 - Introduce environment variable RUNS_ON (O. Weng)
+# 1.0.2 - 2026-02-25 - Add exclude-iflow-ids parameter to exclude specific IFLOWs from deployment (O. Weng)
+# 1.1.0 - 2026-02-27 - Add btp-eic-runtimes parameter for Edge Integration Cell support (O. Weng)
+# 1.2.0 - 2026-04-24 - Move cx-derive-iflow-exclusions into btp-update-runtime job for fresh data on restart (O. Weng)
+# 1.3.0 - 2026-05-05 - Add btp-eic-url-template parameter; EIC URL path not yet published — subject to change
+# 1.3.1 - 2026-05-19 - Add enable-set-log-level pass-through to update-runtime (O. Weng)
+# 1.3.2 - 2026-05-21 - Add explicit permissions block for GITHUB_TOKEN hardening; split GitHub App into CICD reader and consumer bot (O.Weng)
+#
+name: Delete / Upload IntegrationPackages/PartnerDirectory
+
+on:
+  workflow_call:
+    inputs:
+      workflow-ref:
+        description: "GIT Reference Workflow should run in"
+        required: true
+        type: string
+      target-env:
+        description: "Environment"
+        required: true
+        type: string
+      source-ref:
+        description: "GIT Source Reference"
+        required: true
+        type: string   
+      integrationpackages-upload-ids:
+        description: "Comma-separated list of IDs to upload IntegrationPackages"
+        required: false
+        type: string
+      integrationpackages-delete-ids:
+        description: "Comma-separated list of IDs to delete IntegrationPackages"
+        required: false
+        type: string
+      partnerdirectory-upload-ids:
+        description: "Comma-separated list of IDs to upload PartnerDirectory"
+        required: false
+        type: string       
+      partnerdirectory-delete-ids:
+        description: "Comma-separated list of IDs to delete PartnerDirectory"
+        required: false
+        type: string
+      attach-zip-only:
+        description: "Only Attach ZIP file for Package(s)?"
+        required: false
+        default: "false"
+        type: string
+      exclude-iflow-ids:
+        description: "Comma-separated list of IFLOW IDs to exclude from deployment"
+        required: false
+        default: ""
+        type: string
+      base-ref:
+        description: "GIT Base Reference (passed to customer exit for context)"
+        required: false
+        default: ""
+        type: string
+      cx-iflow-exclusions:
+        description: "Whether to run the cx-derive-iflow-exclusions customer exit per deployment job (true/false)"
+        required: false
+        default: "false"
+        type: string
+      cx-repository:
+        description: "Remote extension repository for customer exits (org/repo)"
+        required: false
+        default: ""
+        type: string
+      cx-repository-ref:
+        description: "Git ref for the extension repository"
+        required: false
+        default: "main"
+        type: string
+      btp-api-user:
+        description: "BTP Service Key (ClientID) to access Token Endpoint"
+        required: true
+        type: string
+      btp-tec-user:
+        description: "BTP technical User with Access Policy for Integration Suite"
+        required: true
+        type: string
+      btp-token-url:
+        description: "URL on BTP to request Token"
+        required: true
+        type: string    
+      btp-api-url:
+        description: "URL on BTP to access APIs"
+        required: true
+        type: string
+      btp-eic-runtimes:
+        description: "Comma-separated list of Edge Integration Cell runtime identifiers (optional). If provided, Partner Directory entries will also be synced to these EIC runtimes."
+        required: false
+        default: ""
+        type: string
+      btp-eic-url-template:
+        description: "URL path template for Edge Integration Cell API. Not published — subject to change. Required when btp-eic-runtimes is set."
+        required: false
+        type: string
+      enable-set-log-level:
+        description: "Set MPL log level after deployment (uses undocumented API — disable if endpoint breaks)"
+        required: false
+        default: 'true'
+        type: string
+      git-cicd-orgrepo:
+        description: "Remote GIT Org/Repo for CICD"
+        required: true
+        type: string
+    secrets:
+      BTP_TEC_PASSWORD:
+        required: true
+      BTP_API_PASSWORD:
+        required: true
+      GIT_CICD_TOKEN:
+        description: "GIT Token of remote CICD Repo (fallback — superseded by GIT_CICD_APP_ID + GIT_CICD_APP_PRIVATE_KEY)"
+        required: false
+      GIT_CICD_APP_PRIVATE_KEY:
+        description: "GitHub App private key PEM for CICD reader app (preferred — used together with GIT_CICD_APP_ID variable)"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  preprocess-ids:
+    name: Preprocess Ids
+    environment: ${{ github.event.inputs.target-env }}
+    runs-on: ${{ vars.RUNS_ON && fromJson(vars.RUNS_ON) || 'ubuntu-latest' }}
+    outputs:
+      integrationpackages_to_upload: ${{ steps.parse-csv-to-json-packages.outputs.to_upload }}
+      integrationpackages_all_ids: ${{ steps.parse-csv-to-json-packages.outputs.all_ids }}
+      partnerdirectory_to_upload: ${{ steps.parse-csv-to-json-pid.outputs.to_upload }}
+      partnerdirectory_all_ids: ${{ steps.parse-csv-to-json-pid.outputs.all_ids }}
+
+    steps:
+      # ─── Token resolution (GitHub App preferred, PAT fallback) ───
+      - name: Resolve CICD org
+        id: cicd-org
+        shell: bash
+        env:
+          ORGREPO: ${{ inputs.git-cicd-orgrepo }}
+        run: echo "owner=${ORGREPO%%/*}" >> $GITHUB_OUTPUT
+
+      - name: Generate GitHub App token
+        id: app-token-cicd
+        if: ${{ vars.GIT_CICD_APP_ID != '' }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.GIT_CICD_APP_ID }}
+          private-key: ${{ secrets.GIT_CICD_APP_PRIVATE_KEY }}
+          owner: ${{ steps.cicd-org.outputs.owner }}
+
+      - name: Resolve CICD token
+        id: cicd-token
+        shell: bash
+        env:
+          APP_TOKEN: ${{ steps.app-token-cicd.outputs.token }}
+          PAT_TOKEN: ${{ secrets.GIT_CICD_TOKEN }}
+        run: |
+          TOKEN="${APP_TOKEN:-$PAT_TOKEN}"
+          [ -z "$TOKEN" ] && echo "🛑 No CICD token: set GIT_CICD_APP_ID variable + GIT_CICD_APP_PRIVATE_KEY secret, or set GIT_CICD_TOKEN" && exit 1
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Checkout cicd-actions-intsuite repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.git-cicd-orgrepo }}
+          ref: ${{ inputs.workflow-ref }}
+          path: cicd-btp-insuite
+          token: ${{ steps.cicd-token.outputs.token }}
+
+      - name: Parse IntegrationPackages CSVs to JSON arrays
+        id: parse-csv-to-json-packages
+        uses: ./cicd-btp-insuite/.github/actions/parse-csv-to-json
+        with:
+          delete-ids: ${{ inputs.integrationpackages-delete-ids  }}
+          upload-ids: ${{ inputs.integrationpackages-upload-ids }}
+          empty-array-default: EmptyMatrix
+
+      - name: Parse PartnerDirectory CSVs to JSON arrays
+        id: parse-csv-to-json-pid
+        uses: ./cicd-btp-insuite/.github/actions/parse-csv-to-json
+        with:
+          delete-ids: ${{ inputs.partnerdirectory-delete-ids }}
+          upload-ids: ${{ inputs.partnerdirectory-upload-ids }}
+          empty-array-default: EmptyMatrix
+
+  attach-zips-only:
+    name: Prepare & Attach ZIP Packages
+    needs: [preprocess-ids]
+    if: ${{ inputs.attach-zip-only == 'true' }}
+    runs-on: ${{ vars.RUNS_ON && fromJson(vars.RUNS_ON) || 'ubuntu-latest' }}
+
+    strategy:
+      max-parallel: 5
+      matrix:
+        id: ${{ fromJson(needs.preprocess-ids.outputs.integrationpackages_to_upload) }}
+
+    steps:
+      # ─── Token resolution (GitHub App preferred, PAT fallback) ───
+      - name: Resolve CICD org
+        id: cicd-org
+        if: ${{ matrix.id != 'EmptyMatrix' }}
+        shell: bash
+        env:
+          ORGREPO: ${{ inputs.git-cicd-orgrepo }}
+        run: echo "owner=${ORGREPO%%/*}" >> $GITHUB_OUTPUT
+
+      - name: Generate GitHub App token
+        id: app-token-cicd
+        if: ${{ matrix.id != 'EmptyMatrix' && vars.GIT_CICD_APP_ID != '' }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.GIT_CICD_APP_ID }}
+          private-key: ${{ secrets.GIT_CICD_APP_PRIVATE_KEY }}
+          owner: ${{ steps.cicd-org.outputs.owner }}
+
+      - name: Resolve CICD token
+        id: cicd-token
+        if: ${{ matrix.id != 'EmptyMatrix' }}
+        shell: bash
+        env:
+          APP_TOKEN: ${{ steps.app-token-cicd.outputs.token }}
+          PAT_TOKEN: ${{ secrets.GIT_CICD_TOKEN }}
+        run: |
+          TOKEN="${APP_TOKEN:-$PAT_TOKEN}"
+          [ -z "$TOKEN" ] && echo "🛑 No CICD token: set GIT_CICD_APP_ID variable + GIT_CICD_APP_PRIVATE_KEY secret, or set GIT_CICD_TOKEN" && exit 1
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Checkout cicd-actions-intsuite repo
+        if: ${{ matrix.id != 'EmptyMatrix' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.git-cicd-orgrepo }}
+          ref: ${{ inputs.workflow-ref }}
+          path: cicd-btp-insuite
+          token: ${{ steps.cicd-token.outputs.token }}
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source-ref }}
+          path: btp-insuite
+
+      - name: Prepare ZIP and attach artifact
+        if: ${{ matrix.id != 'EmptyMatrix' }}
+        uses: ./cicd-btp-insuite/.github/actions/prepare-zip-from-dir
+        with:
+          package-id: ${{ matrix.id }}
+          attach-zip: "true"
+
+  btp-runtime-delete:
+    if: ${{ inputs.attach-zip-only != 'true' }}
+    needs: [preprocess-ids]
+    name: Undeploy Package ${{ matrix.id }}
+    environment: ${{ inputs.target-env }}
+    strategy:
+      max-parallel: 2
+      fail-fast: false
+      matrix:
+        id: ${{ fromJson(needs.preprocess-ids.outputs.integrationpackages_all_ids) }}
+    runs-on: ${{ vars.RUNS_ON && fromJson(vars.RUNS_ON) || 'ubuntu-latest' }}
+
+    steps:
+      # ─── Token resolution (GitHub App preferred, PAT fallback) ───
+      - name: Resolve CICD org
+        id: cicd-org
+        if: ${{ matrix.id != 'EmptyMatrix' }}
+        shell: bash
+        env:
+          ORGREPO: ${{ inputs.git-cicd-orgrepo }}
+        run: echo "owner=${ORGREPO%%/*}" >> $GITHUB_OUTPUT
+
+      - name: Generate GitHub App token
+        id: app-token-cicd
+        if: ${{ matrix.id != 'EmptyMatrix' && vars.GIT_CICD_APP_ID != '' }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.GIT_CICD_APP_ID }}
+          private-key: ${{ secrets.GIT_CICD_APP_PRIVATE_KEY }}
+          owner: ${{ steps.cicd-org.outputs.owner }}
+
+      - name: Resolve CICD token
+        id: cicd-token
+        if: ${{ matrix.id != 'EmptyMatrix' }}
+        shell: bash
+        env:
+          APP_TOKEN: ${{ steps.app-token-cicd.outputs.token }}
+          PAT_TOKEN: ${{ secrets.GIT_CICD_TOKEN }}
+        run: |
+          TOKEN="${APP_TOKEN:-$PAT_TOKEN}"
+          [ -z "$TOKEN" ] && echo "🛑 No CICD token: set GIT_CICD_APP_ID variable + GIT_CICD_APP_PRIVATE_KEY secret, or set GIT_CICD_TOKEN" && exit 1
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Checkout cicd-actions-intsuite repo
+        if: ${{ matrix.id != 'EmptyMatrix' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.git-cicd-orgrepo }}
+          ref: ${{ inputs.workflow-ref }}
+          path: cicd-btp-insuite
+          token: ${{ steps.cicd-token.outputs.token }} 
+          
+      - name: Delete Package from Runtime
+        if: ${{ matrix.id != 'EmptyMatrix' }}
+        uses: ./cicd-btp-insuite/.github/actions/update-runtime
+        with:
+          target-env: ${{ inputs.target-env }}
+          source-ref: ${{ inputs.source-ref }}
+          package-id: ${{ matrix.id }}
+          mode: "Undeploy"
+          btp-api-user: ${{ inputs.btp-api-user }}
+          btp-tec-user: ${{ inputs.btp-tec-user }}
+          btp-token-url: ${{ inputs.btp-token-url }}
+          btp-api-url: ${{ inputs.btp-api-url }}
+          BTP_TEC_PASSWORD: ${{ secrets.BTP_TEC_PASSWORD }}
+          BTP_API_PASSWORD: ${{ secrets.BTP_API_PASSWORD }}
+          
+  btp-pd-delete:
+    if: ${{ inputs.attach-zip-only != 'true' }}
+    needs: [preprocess-ids, btp-runtime-delete]
+    name: Delete PD ${{ matrix.id }}
+    environment: ${{ inputs.target-env }}
+    strategy:
+      max-parallel: 10
+      fail-fast: false
+      matrix:
+        id: ${{ fromJson(needs.preprocess-ids.outputs.partnerdirectory_all_ids) }}
+    runs-on: ${{ vars.RUNS_ON && fromJson(vars.RUNS_ON) || 'ubuntu-latest' }}
+
+    steps:
+      # ─── Token resolution (GitHub App preferred, PAT fallback) ───
+      - name: Resolve CICD org
+        id: cicd-org
+        if: ${{ matrix.id != 'EmptyMatrix' }}
+        shell: bash
+        env:
+          ORGREPO: ${{ inputs.git-cicd-orgrepo }}
+        run: echo "owner=${ORGREPO%%/*}" >> $GITHUB_OUTPUT
+
+      - name: Generate GitHub App token
+        id: app-token-cicd
+        if: ${{ matrix.id != 'EmptyMatrix' && vars.GIT_CICD_APP_ID != '' }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.GIT_CICD_APP_ID }}
+          private-key: ${{ secrets.GIT_CICD_APP_PRIVATE_KEY }}
+          owner: ${{ steps.cicd-org.outputs.owner }}
+
+      - name: Resolve CICD token
+        id: cicd-token
+        if: ${{ matrix.id != 'EmptyMatrix' }}
+        shell: bash
+        env:
+          APP_TOKEN: ${{ steps.app-token-cicd.outputs.token }}
+          PAT_TOKEN: ${{ secrets.GIT_CICD_TOKEN }}
+        run: |
+          TOKEN="${APP_TOKEN:-$PAT_TOKEN}"
+          [ -z "$TOKEN" ] && echo "🛑 No CICD token: set GIT_CICD_APP_ID variable + GIT_CICD_APP_PRIVATE_KEY secret, or set GIT_CICD_TOKEN" && exit 1
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Checkout cicd-actions-intsuite repo
+        if: ${{ matrix.id != 'EmptyMatrix' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.git-cicd-orgrepo }}
+          ref: ${{ inputs.workflow-ref }}
+          path: cicd-btp-insuite
+          token: ${{ steps.cicd-token.outputs.token }} 
+          
+      - name: Request OAuth Token
+        if: ${{ matrix.id != 'EmptyMatrix' }}
+        id: get-token
+        uses: ./cicd-btp-insuite/.github/actions/get-token
+        with:
+          btp-api-user: ${{ inputs.btp-api-user }}
+          btp-tec-user: ${{ inputs.btp-tec-user }}
+          btp-token-url: ${{ inputs.btp-token-url }}
+          BTP_API_PASSWORD: ${{ secrets.BTP_API_PASSWORD }}
+          BTP_TEC_PASSWORD: ${{ secrets.BTP_TEC_PASSWORD }}
+
+      - name: Delete Partner Directory Entry
+        if: ${{ matrix.id != 'EmptyMatrix' }}
+        uses: ./cicd-btp-insuite/.github/actions/delete-partner-directory-entry
+        with:
+          bearer-token: ${{ steps.get-token.outputs.token }}
+          btp-api-url: ${{ inputs.btp-api-url }}
+          partner-id: ${{ matrix.id }}
+          eic-runtimes: ${{ inputs.btp-eic-runtimes }}
+          eic-url-template: ${{ inputs.btp-eic-url-template }}
+
+  btp-designtime-delete:
+    if: ${{ inputs.attach-zip-only != 'true' }}
+    needs: [preprocess-ids, btp-pd-delete]
+    name: Delete Package ${{ matrix.id }}
+    environment: ${{ inputs.target-env }}
+    strategy:
+      max-parallel: 10
+      fail-fast: false
+      matrix:
+        id: ${{ fromJson(needs.preprocess-ids.outputs.integrationpackages_all_ids) }}
+    runs-on: ${{ vars.RUNS_ON && fromJson(vars.RUNS_ON) || 'ubuntu-latest' }}
+
+    steps:
+      # ─── Token resolution (GitHub App preferred, PAT fallback) ───
+      - name: Resolve CICD org
+        id: cicd-org
+        if: ${{ matrix.id != 'EmptyMatrix' }}
+        shell: bash
+        env:
+          ORGREPO: ${{ inputs.git-cicd-orgrepo }}
+        run: echo "owner=${ORGREPO%%/*}" >> $GITHUB_OUTPUT
+
+      - name: Generate GitHub App token
+        id: app-token-cicd
+        if: ${{ matrix.id != 'EmptyMatrix' && vars.GIT_CICD_APP_ID != '' }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.GIT_CICD_APP_ID }}
+          private-key: ${{ secrets.GIT_CICD_APP_PRIVATE_KEY }}
+          owner: ${{ steps.cicd-org.outputs.owner }}
+
+      - name: Resolve CICD token
+        id: cicd-token
+        if: ${{ matrix.id != 'EmptyMatrix' }}
+        shell: bash
+        env:
+          APP_TOKEN: ${{ steps.app-token-cicd.outputs.token }}
+          PAT_TOKEN: ${{ secrets.GIT_CICD_TOKEN }}
+        run: |
+          TOKEN="${APP_TOKEN:-$PAT_TOKEN}"
+          [ -z "$TOKEN" ] && echo "🛑 No CICD token: set GIT_CICD_APP_ID variable + GIT_CICD_APP_PRIVATE_KEY secret, or set GIT_CICD_TOKEN" && exit 1
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Checkout cicd-actions-intsuite repo
+        if: ${{ matrix.id != 'EmptyMatrix' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.git-cicd-orgrepo }}
+          ref: ${{ inputs.workflow-ref }}
+          path: cicd-btp-insuite
+          token: ${{ steps.cicd-token.outputs.token }}
+
+      - name: Delete Package from Design Time
+        if: ${{ matrix.id != 'EmptyMatrix' }}
+        uses: ./cicd-btp-insuite/.github/actions/update-designtime
+        with:
+          target-env: ${{ inputs.target-env }}
+          source-ref: ${{ inputs.source-ref }}
+          package-id: ${{ matrix.id }}
+          case: "Delete"
+          btp-api-user: ${{ inputs.btp-api-user }}
+          btp-tec-user: ${{ inputs.btp-tec-user }}
+          btp-token-url: ${{ inputs.btp-token-url }}
+          btp-api-url: ${{ inputs.btp-api-url }}
+          BTP_API_PASSWORD:  ${{ secrets.BTP_API_PASSWORD }}
+          BTP_TEC_PASSWORD:  ${{ secrets.BTP_TEC_PASSWORD }}
+  
+  btp-designtime-upload:
+    if: ${{ inputs.attach-zip-only != 'true' }}
+    needs: [preprocess-ids, btp-designtime-delete]
+    name: Upload Package ${{ matrix.id }}
+    environment: ${{ inputs.target-env }}
+    strategy:
+      max-parallel: 10
+      fail-fast: false
+      matrix:
+        id: ${{ fromJson(needs.preprocess-ids.outputs.integrationpackages_to_upload) }}
+    runs-on: ${{ vars.RUNS_ON && fromJson(vars.RUNS_ON) || 'ubuntu-latest' }}
+
+    steps:
+      # ─── Token resolution (GitHub App preferred, PAT fallback) ───
+      - name: Resolve CICD org
+        id: cicd-org
+        if: ${{ matrix.id != 'EmptyMatrix' }}
+        shell: bash
+        env:
+          ORGREPO: ${{ inputs.git-cicd-orgrepo }}
+        run: echo "owner=${ORGREPO%%/*}" >> $GITHUB_OUTPUT
+
+      - name: Generate GitHub App token
+        id: app-token-cicd
+        if: ${{ matrix.id != 'EmptyMatrix' && vars.GIT_CICD_APP_ID != '' }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.GIT_CICD_APP_ID }}
+          private-key: ${{ secrets.GIT_CICD_APP_PRIVATE_KEY }}
+          owner: ${{ steps.cicd-org.outputs.owner }}
+
+      - name: Resolve CICD token
+        id: cicd-token
+        if: ${{ matrix.id != 'EmptyMatrix' }}
+        shell: bash
+        env:
+          APP_TOKEN: ${{ steps.app-token-cicd.outputs.token }}
+          PAT_TOKEN: ${{ secrets.GIT_CICD_TOKEN }}
+        run: |
+          TOKEN="${APP_TOKEN:-$PAT_TOKEN}"
+          [ -z "$TOKEN" ] && echo "🛑 No CICD token: set GIT_CICD_APP_ID variable + GIT_CICD_APP_PRIVATE_KEY secret, or set GIT_CICD_TOKEN" && exit 1
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Checkout cicd-actions-intsuite repo
+        if: ${{ matrix.id != 'EmptyMatrix' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.git-cicd-orgrepo }}
+          ref: ${{ inputs.workflow-ref }}
+          path: cicd-btp-insuite
+          token: ${{ steps.cicd-token.outputs.token }}
+          
+      - name: Upload Package to Design Time
+        if: ${{ matrix.id != 'EmptyMatrix' }}
+        uses: ./cicd-btp-insuite/.github/actions/update-designtime
+        with:
+          target-env: ${{ inputs.target-env }}
+          source-ref: ${{ inputs.source-ref }}
+          package-id: ${{ matrix.id }}
+          case: "Upload"
+          btp-api-user: ${{ inputs.btp-api-user }}
+          btp-tec-user: ${{ inputs.btp-tec-user }}
+          btp-token-url: ${{ inputs.btp-token-url }}
+          btp-api-url: ${{ inputs.btp-api-url }}
+          BTP_API_PASSWORD:  ${{ secrets.BTP_API_PASSWORD }}
+          BTP_TEC_PASSWORD:  ${{ secrets.BTP_TEC_PASSWORD }}   
+       
+  btp-pd-upload:
+    if: ${{ inputs.attach-zip-only != 'true' }}
+    needs: [preprocess-ids, btp-designtime-upload]
+    name: Upload PD ${{ matrix.id }}
+    environment: ${{ inputs.target-env }}
+    strategy:
+      max-parallel: 10
+      fail-fast: false
+      matrix:
+        id: ${{ fromJson(needs.preprocess-ids.outputs.partnerdirectory_to_upload) }}
+    runs-on: ${{ vars.RUNS_ON && fromJson(vars.RUNS_ON) || 'ubuntu-latest' }}
+
+    steps:
+      # ─── Token resolution (GitHub App preferred, PAT fallback) ───
+      - name: Resolve CICD org
+        id: cicd-org
+        if: ${{ matrix.id != 'EmptyMatrix' }}
+        shell: bash
+        env:
+          ORGREPO: ${{ inputs.git-cicd-orgrepo }}
+        run: echo "owner=${ORGREPO%%/*}" >> $GITHUB_OUTPUT
+
+      - name: Generate GitHub App token
+        id: app-token-cicd
+        if: ${{ matrix.id != 'EmptyMatrix' && vars.GIT_CICD_APP_ID != '' }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.GIT_CICD_APP_ID }}
+          private-key: ${{ secrets.GIT_CICD_APP_PRIVATE_KEY }}
+          owner: ${{ steps.cicd-org.outputs.owner }}
+
+      - name: Resolve CICD token
+        id: cicd-token
+        if: ${{ matrix.id != 'EmptyMatrix' }}
+        shell: bash
+        env:
+          APP_TOKEN: ${{ steps.app-token-cicd.outputs.token }}
+          PAT_TOKEN: ${{ secrets.GIT_CICD_TOKEN }}
+        run: |
+          TOKEN="${APP_TOKEN:-$PAT_TOKEN}"
+          [ -z "$TOKEN" ] && echo "🛑 No CICD token: set GIT_CICD_APP_ID variable + GIT_CICD_APP_PRIVATE_KEY secret, or set GIT_CICD_TOKEN" && exit 1
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Checkout cicd-actions-intsuite repo
+        if: ${{ matrix.id != 'EmptyMatrix' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.git-cicd-orgrepo }}
+          ref: ${{ inputs.workflow-ref }}
+          path: cicd-btp-insuite
+          token: ${{ steps.cicd-token.outputs.token }} 
+
+      - name: Create Partner Directory Entry
+        if: ${{ matrix.id != 'EmptyMatrix' }}
+        uses: ./cicd-btp-insuite/.github/actions/create-pid
+        with:
+          target-env: ${{ inputs.target-env }}
+          source-ref: ${{ inputs.source-ref }}
+          partner-id: ${{ matrix.id }}
+          btp-api-user: ${{ inputs.btp-api-user }}
+          btp-tec-user: ${{ inputs.btp-tec-user }}
+          btp-token-url: ${{ inputs.btp-token-url }}
+          btp-api-url: ${{ inputs.btp-api-url }}
+          BTP_API_PASSWORD: ${{ secrets.BTP_API_PASSWORD }}
+          BTP_TEC_PASSWORD: ${{ secrets.BTP_TEC_PASSWORD }}
+          eic-runtimes: ${{ inputs.btp-eic-runtimes }}
+          eic-url-template: ${{ inputs.btp-eic-url-template }}
+
+  btp-update-runtime:
+    if: ${{ inputs.attach-zip-only != 'true' }}
+    name: Deploy Package ${{ matrix.id }}
+    environment: ${{ inputs.target-env }}
+    needs: [preprocess-ids, btp-pd-upload]
+    strategy:
+      max-parallel: 2
+      fail-fast: false
+      matrix:
+        id: ${{ fromJson(needs.preprocess-ids.outputs.integrationpackages_to_upload) }}
+    runs-on: ${{ vars.RUNS_ON && fromJson(vars.RUNS_ON) || 'ubuntu-latest' }}
+
+    steps:
+      # ─── Token resolution (GitHub App preferred, PAT fallback) ───
+      - name: Resolve CICD org
+        id: cicd-org
+        if: ${{ matrix.id != 'EmptyMatrix' }}
+        shell: bash
+        env:
+          ORGREPO: ${{ inputs.git-cicd-orgrepo }}
+        run: echo "owner=${ORGREPO%%/*}" >> $GITHUB_OUTPUT
+
+      - name: Generate GitHub App token
+        id: app-token-cicd
+        if: ${{ matrix.id != 'EmptyMatrix' && vars.GIT_CICD_APP_ID != '' }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.GIT_CICD_APP_ID }}
+          private-key: ${{ secrets.GIT_CICD_APP_PRIVATE_KEY }}
+          owner: ${{ steps.cicd-org.outputs.owner }}
+
+      - name: Resolve CICD token
+        id: cicd-token
+        if: ${{ matrix.id != 'EmptyMatrix' }}
+        shell: bash
+        env:
+          APP_TOKEN: ${{ steps.app-token-cicd.outputs.token }}
+          PAT_TOKEN: ${{ secrets.GIT_CICD_TOKEN }}
+        run: |
+          TOKEN="${APP_TOKEN:-$PAT_TOKEN}"
+          [ -z "$TOKEN" ] && echo "🛑 No CICD token: set GIT_CICD_APP_ID variable + GIT_CICD_APP_PRIVATE_KEY secret, or set GIT_CICD_TOKEN" && exit 1
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Checkout cicd-actions-intsuite repo
+        if: ${{ matrix.id != 'EmptyMatrix' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.git-cicd-orgrepo }}
+          ref: ${{ inputs.workflow-ref }}
+          path: cicd-btp-insuite
+          token: ${{ steps.cicd-token.outputs.token }}
+
+      - name: Call Customer Exit - Derive IFlow Exclusions
+        if: ${{ inputs.cx-iflow-exclusions == 'true' && matrix.id != 'EmptyMatrix' }}
+        id: call-exit
+        uses: ./cicd-btp-insuite/.github/actions/call-cx-derive-iflow-exclusions
+        with:
+          cx-active: ${{ inputs.cx-iflow-exclusions }}
+          intsuite-repo-path: intsuite-repo
+          extension-repo-path: cx-extension-repo
+          cx-repository: ${{ inputs.cx-repository }}
+          cx-repository-ref: ${{ inputs.cx-repository-ref }}
+          git-cicd-token: ${{ steps.cicd-token.outputs.token }}
+          btp-tec-password: ${{ secrets.BTP_TEC_PASSWORD }}
+          btp-api-password: ${{ secrets.BTP_API_PASSWORD }}
+          target-env: ${{ inputs.target-env }}
+          base-ref: ${{ inputs.base-ref }}
+          target-ref: ${{ inputs.source-ref }}
+          perform-deploy: 'true'
+          btp-api-user: ${{ inputs.btp-api-user }}
+          btp-tec-user: ${{ inputs.btp-tec-user }}
+          btp-token-url: ${{ inputs.btp-token-url }}
+          btp-api-url: ${{ inputs.btp-api-url }}
+          git-cicd-orgrepo: ${{ inputs.git-cicd-orgrepo }}
+
+      - name: Deploy Package to Runtime
+        if: ${{ matrix.id != 'EmptyMatrix' }}
+        uses: ./cicd-btp-insuite/.github/actions/update-runtime
+        with:
+          target-env: ${{ inputs.target-env }}
+          source-ref: ${{ inputs.source-ref }}
+          package-id: ${{ matrix.id }}
+          mode: "Deploy"
+          iflow-deploy: "true"
+          btp-api-user: ${{ inputs.btp-api-user }}
+          btp-tec-user: ${{ inputs.btp-tec-user }}
+          btp-token-url: ${{ inputs.btp-token-url }}
+          btp-api-url: ${{ inputs.btp-api-url }}
+          BTP_TEC_PASSWORD: ${{ secrets.BTP_TEC_PASSWORD }}
+          BTP_API_PASSWORD: ${{ secrets.BTP_API_PASSWORD }}
+          exclude-iflow-ids: ${{ steps.call-exit.outputs.exclude-iflow-ids || inputs.exclude-iflow-ids }}
+          enable-set-log-level: ${{ inputs.enable-set-log-level }}
+          
+  output-status:
+    needs: [preprocess-ids, attach-zips-only, btp-runtime-delete, btp-pd-delete, btp-designtime-delete, btp-designtime-upload, btp-pd-upload, btp-update-runtime]
+    environment: ${{ inputs.target-env }}
+    if: ${{ always() }}
+    runs-on: ${{ vars.RUNS_ON && fromJson(vars.RUNS_ON) || 'ubuntu-latest' }}
+    steps:
+      - name: Echo Status
+        run: |
+          echo "needs.preprocess-ids.result = ${{ needs.preprocess-ids.result }}"
+          echo "needs.btp-runtime-delete.result = ${{ needs.btp-runtime-delete.result }}"
+          echo "needs.btp-pd-delete.result = ${{ needs.btp-pd-delete.result }}"
+          echo "needs.btp-designtime-delete.result = ${{ needs.btp-designtime-delete.result }}"
+          echo "needs.btp-designtime-upload.result = ${{ needs.btp-designtime-upload.result }}"
+          echo "needs.btp-pd-upload.result = ${{ needs.btp-pd-upload.result }}"
+          echo "needs.btp-update-runtime.result = ${{ needs.btp-update-runtime.result }}"
