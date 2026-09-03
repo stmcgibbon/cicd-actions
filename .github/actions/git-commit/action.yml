@@ -1,0 +1,86 @@
+# Copyright (c) 2025 Mercedes-Benz AG
+# Oliver Weng <sap.weng@extaccount.com>
+#
+# Version History:
+# 1.0.0 - 2025-11-24 - Initial release (O. Weng)
+# 1.0.1 - 2026-03-05 - Added EMU (Enterprise Managed User) actor resolution (O. Weng)
+# 1.0.2 - 2026-04-23 - Added directory input to support multiple target directories
+#
+name: GIT Commit
+description: GIT Commit
+
+inputs:
+  comment:
+    description: "Commit Comment"
+    required: true
+  directory:
+    description: "Working directory for git commit (relative to repo root)"
+    required: false
+    default: "btp-insuite/IntegrationPackages"
+
+runs:
+  using: "composite"
+  steps:
+    - id: git-commit
+      working-directory: ${{ inputs.directory }}
+      shell: bash
+      env:
+        COMMENT: ${{ inputs.comment }}
+      run: |
+        set -e
+
+        # Resolve EMU (Enterprise Managed User) suffix if present
+        # EMU users have format USERNAME_SHORTCODE (e.g., johndoe_a1b2c3d4)
+        ACTOR="${{ github.actor }}"
+        ACTOR_SHORT="${ACTOR%_*}"
+        if [ "$ACTOR_SHORT" != "$ACTOR" ]; then
+          echo "ℹ️  Detected potential EMU suffix, using '$ACTOR_SHORT' instead of '$ACTOR'"
+          ACTOR="$ACTOR_SHORT"
+        fi
+
+        git config user.name "$ACTOR"
+        git config user.email "$ACTOR@users.noreply.github.com"
+  
+        git add -A
+  
+        # Only commit if there are staged changes
+        if ! git diff --cached --quiet; then
+          git commit -m "$COMMENT"
+
+          # Try to push, retry with rebase if necessary
+          tries=5
+          count=0
+          while ! git push origin HEAD; do
+            if [ $count -ge $tries ]; then
+              echo "🛑 Push failed after $tries attempts"
+              exit 1
+            fi
+            echo "💥 Push failed, rebasing and retrying... attempt $((count+1))/$tries"
+            git pull --rebase origin "$(git rev-parse --abbrev-ref HEAD)"
+            count=$((count + 1))
+          done
+
+          # Wait for remote branch to reflect the pushed commit
+          commit_sha=$(git rev-parse HEAD)
+          remote_branch=$(git rev-parse --abbrev-ref HEAD)
+          remote="origin"
+
+          echo "🔍 Verifying remote branch is updated with commit $commit_sha ..."
+          for i in {1..10}; do
+            git fetch $remote $remote_branch
+            remote_sha=$(git rev-parse "$remote/$remote_branch")
+            if [ "$remote_sha" = "$commit_sha" ]; then
+              echo "✅ Remote updated with the commit."
+              break
+            fi
+            echo "⏳ Waiting for remote to update... ($i/10)"
+            sleep 2
+          done
+
+          if [ "$remote_sha" != "$commit_sha" ]; then
+            echo "⚠️ Warning: Remote not updated with commit after waiting. Continue..."
+          fi
+          
+        else
+          echo "➖ No changes to commit"
+        fi
